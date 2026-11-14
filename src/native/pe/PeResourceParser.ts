@@ -1,6 +1,18 @@
+import {
+  PE_RESOURCE_DIRECTORY_BYTES,
+  PE_RESOURCE_ENTRY_BYTES,
+  PE_RESOURCE_NAME_PREFIX_BYTES,
+  readPeResourceDirectoryFacts,
+  readPeResourceEntryFacts,
+  readPeResourceNameFacts,
+  type PeResourceIdentityDeclaration,
+} from "./PeResourceTreeFacts.js";
 import { createHash } from "node:crypto";
 import { setImmediate } from "node:timers/promises";
+import { assertArtifactReadActive } from "../../artifacts/ArtifactFileOperation.js";
 import { ArtifactReaderFailure } from "../../artifacts/ArtifactReader.js";
+import type { ArtifactLimitBoundary } from "../../domain/artifactOperationError.js";
+import { jsonParts } from "../../domain/jsonSerialization.js";
 import type {
   InspectPeResourcesInput,
   PeResourceIdentity,
@@ -12,13 +24,26 @@ import {
   requirePeRange,
 } from "./PeResourceLayout.js";
 
+type PeResourceLayout = ReturnType<typeof readPeResourceLayout>;
+
 type Range = { offset: number; bytes: number };
 type OccupiedRange = Range & {
   kind: "directory" | "name" | "data-entry" | "payload";
 };
-const METADATA_BYTES = 8 * 1024 * 1024;
-const limit = (message: string): never => {
-  throw new ArtifactReaderFailure("limit", message);
+/** Complete PE resource result retained before a refusal. */
+export const PE_RESOURCE_METADATA_BYTES = 8 * 1024 * 1024;
+const METADATA_BYTES = PE_RESOURCE_METADATA_BYTES;
+const limit = (message: string, boundary: ArtifactLimitBoundary): never => {
+  throw new ArtifactReaderFailure("limit", message, { boundary });
+};
+/** Count bytes through the canonical bounded JSON writer. */
+const jsonBytes = (value: unknown, maximum: number): number => {
+  let size = 0;
+  for (const part of jsonParts(value)) {
+    size += Buffer.byteLength(part, "utf8");
+    if (size > maximum) return size;
+  }
+  return size;
 };
 const identityKey = (id: PeResourceIdentity): string =>
   id.kind === "id" ? `id:${String(id.id)}` : `name:${id.utf16le_hex}`;
@@ -29,21 +54,38 @@ export const parsePeResources = async (
   artifact: PeResources["artifact"],
   input: InspectPeResourcesInput,
   signal?: AbortSignal,
+  /** Already admitted from these same bytes; used by carrier probes that own layout failure policy. */
+  admittedLayout?: PeResourceLayout,
 ): Promise<PeResources> => {
-  signal?.throwIfAborted();
-  const layout = readPeResourceLayout(bytes);
+  assertArtifactReadActive(signal);
+  const layout = admittedLayout ?? readPeResourceLayout(bytes);
   const directories: PeResources["directories"] = [];
   const resources: PeResources["resources"] = [];
   const occupied: OccupiedRange[] = [];
   const names = new Map<number, PeResourceIdentity>();
   let examined = 0;
   let metadataBytes = 0;
-  const account = (value: unknown): void => {
-    metadataBytes += Buffer.byteLength(JSON.stringify(value));
-    if (metadataBytes > METADATA_BYTES)
+  const ensureCapacity = (projectedBytes: number): void => {
+    if (metadataBytes + projectedBytes > METADATA_BYTES)
       limit(
         "PE resource metadata exceeds the 8 MiB complete-result allocation budget.",
+        "memory",
       );
+  };
+  const accountBytes = (projectedBytes: number): void => {
+    ensureCapacity(projectedBytes);
+    metadataBytes += projectedBytes;
+  };
+  const account = (value: unknown): void => {
+    // Rows are retained in arrays; reserve a separator along with each row.
+    accountBytes(jsonBytes(value, METADATA_BYTES - metadataBytes - 1) + 1);
+  };
+  const reserveDecodedName = (utf16Units: number): void => {
+    // A JSON string can need six ASCII bytes per UTF-16 code unit (for example,
+    // a control character encoded as `\\u0000`). The original spelling and
+    // its hex form are both retained in the result.
+    const projectedBytes = 10 * utf16Units + 256;
+    ensureCapacity(projectedBytes);
   };
   const root = layout.size === 0 ? 0 : layout.map(layout.rva, layout.size);
   const relative = (at: number, length: number): number => {
@@ -63,24 +105,35 @@ export const parsePeResources = async (
     if (size > 0) occupied.push({ ...range, kind });
     return range;
   };
-  const readIdentity = (encoded: number): PeResourceIdentity => {
-    if ((encoded & 0x80000000) === 0) return { kind: "id", id: encoded };
-    const at = encoded & 0x7fffffff;
+  const readIdentity = (
+    declaration: PeResourceIdentityDeclaration,
+  ): PeResourceIdentity => {
+    if (declaration.kind === "id") return { kind: "id", id: declaration.id };
+    const at = declaration.offset;
     const previous = names.get(at);
     if (previous !== undefined) return previous;
     if (at % 2 !== 0) peFailure("Unaligned PE resource name.");
-    const start = relative(at, 2);
-    const length = bytes.readUInt16LE(start) * 2;
-    relative(at, 2 + length);
-    const raw = bytes.subarray(start + 2, start + 2 + length);
+    const start = relative(at, PE_RESOURCE_NAME_PREFIX_BYTES);
+    const { utf16Units, payloadBytes: length } = readPeResourceNameFacts(
+      bytes.subarray(start, start + PE_RESOURCE_NAME_PREFIX_BYTES),
+    );
+    reserveDecodedName(utf16Units);
+    relative(at, PE_RESOURCE_NAME_PREFIX_BYTES + length);
+    const raw = bytes.subarray(
+      start + PE_RESOURCE_NAME_PREFIX_BYTES,
+      start + PE_RESOURCE_NAME_PREFIX_BYTES + length,
+    );
     const value: PeResourceIdentity = {
       kind: "name",
       name: raw.toString("utf16le"),
       utf16le_hex: raw.toString("hex"),
-      location: recordRange(start, 2 + length, "name"),
+      location: recordRange(
+        start,
+        PE_RESOURCE_NAME_PREFIX_BYTES + length,
+        "name",
+      ),
     };
     names.set(at, value);
-    account(value);
     return value;
   };
   const visit = async (
@@ -90,51 +143,63 @@ export const parsePeResources = async (
     ancestors: ReadonlySet<number>,
   ): Promise<void> => {
     if (ancestors.has(at)) peFailure("Cyclic PE resource directory.");
-    if (at % 4 !== 0) peFailure("Unaligned PE resource directory.");
-    const header = relative(at, 16);
-    const named = bytes.readUInt16LE(header + 12);
-    const ids = bytes.readUInt16LE(header + 14);
-    const count = named + ids;
+    const header = relative(at, PE_RESOURCE_DIRECTORY_BYTES);
+    const facts = readPeResourceDirectoryFacts(
+      bytes.subarray(header, header + PE_RESOURCE_DIRECTORY_BYTES),
+    );
+    const { namedEntries: named, idEntries: ids, entryCount: count } = facts;
+    relative(at, PE_RESOURCE_DIRECTORY_BYTES + PE_RESOURCE_ENTRY_BYTES * count);
     if (count > input.max_entries - examined)
       limit(
         "PE resource directory entry budget exceeded; no partial inventory was returned.",
+        "capacity",
       );
     examined += count;
-    relative(at, 16 + 8 * count);
     const directory = {
-      location: recordRange(header, 16 + 8 * count, "directory"),
-      characteristics: bytes.readUInt32LE(header),
-      timestamp: bytes.readUInt32LE(header + 4),
-      major_version: bytes.readUInt16LE(header + 8),
-      minor_version: bytes.readUInt16LE(header + 10),
+      path,
+      entry_locations: entryLocations,
+      location: recordRange(
+        header,
+        PE_RESOURCE_DIRECTORY_BYTES + PE_RESOURCE_ENTRY_BYTES * count,
+        "directory",
+      ),
+      characteristics: facts.characteristics,
+      timestamp: facts.timestamp,
+      major_version: facts.majorVersion,
+      minor_version: facts.minorVersion,
       named_entries: named,
       id_entries: ids,
     };
-    directories.push(directory);
     account(directory);
+    directories.push(directory);
     const keys = new Set<string>();
     const nested = new Set([...ancestors, at]);
     for (let index = 0; index < count; index++) {
       if (index % 128 === 0) {
         await setImmediate();
-        signal?.throwIfAborted();
+        assertArtifactReadActive(signal);
       }
-      const entry = header + 16 + index * 8;
-      const encoded = bytes.readUInt32LE(entry);
-      if (((encoded & 0x80000000) !== 0) !== index < named)
+      const entry =
+        header + PE_RESOURCE_DIRECTORY_BYTES + index * PE_RESOURCE_ENTRY_BYTES;
+      const record = readPeResourceEntryFacts(
+        bytes.subarray(entry, entry + PE_RESOURCE_ENTRY_BYTES),
+      );
+      if ((record.identity.kind === "name") !== index < named)
         peFailure(
           "Resource name/ID entry counts disagree with encoded identities.",
         );
-      const identity = readIdentity(encoded);
+      const identity = readIdentity(record.identity);
       const key = identityKey(identity);
       if (keys.has(key))
         peFailure("Duplicate identity within a resource directory.");
       keys.add(key);
       const next = [...path, identity];
-      const locations = [...entryLocations, { offset: entry, bytes: 8 }];
-      const target = bytes.readUInt32LE(entry + 4);
-      const offset = target & 0x7fffffff;
-      if ((target & 0x80000000) !== 0) {
+      const locations = [
+        ...entryLocations,
+        { offset: entry, bytes: PE_RESOURCE_ENTRY_BYTES },
+      ];
+      const { offset } = record.target;
+      if (record.target.kind === "directory") {
         if (next.length >= 3)
           peFailure(
             "Unsupported resource tree deeper than type/name/language.",
@@ -146,7 +211,6 @@ export const parsePeResources = async (
             "Unsupported resource leaf outside the type/name/language profile.",
           );
         const data = relative(offset, 16);
-        if (offset % 4 !== 0) peFailure("Unaligned resource data entry.");
         const rva = bytes.readUInt32LE(data);
         const size = bytes.readUInt32LE(data + 4);
         const payloadOffset = layout.map(rva, size);
@@ -168,8 +232,8 @@ export const parsePeResources = async (
             sha256: "0".repeat(64),
           },
         };
-        resources.push(resource);
         account(resource);
+        resources.push(resource);
       }
     }
   };
@@ -184,7 +248,7 @@ export const parsePeResources = async (
       const hash = createHash("sha256");
       for (let offset = 0; offset < range.bytes; offset += 1048576) {
         await setImmediate();
-        signal?.throwIfAborted();
+        assertArtifactReadActive(signal);
         hash.update(
           bytes.subarray(
             range.offset + offset,
@@ -197,7 +261,7 @@ export const parsePeResources = async (
     }
     resource.payload.sha256 = digest;
   }
-  const iconGroups = readIconGroups(bytes, resources, account);
+  const iconGroups = readIconGroups(bytes, resources, account, ensureCapacity);
   const report: PeResources = {
     artifact,
     format: layout.format,
@@ -224,9 +288,9 @@ export const parsePeResources = async (
       "Exact shared byte ranges are retained; non-identical overlapping resource structures or payloads are rejected.",
     ],
   };
-  signal?.throwIfAborted();
-  if (Buffer.byteLength(JSON.stringify(report)) > METADATA_BYTES)
-    limit("PE resource result exceeds the 8 MiB allocation budget.");
+  assertArtifactReadActive(signal);
+  if (jsonBytes(report, METADATA_BYTES) > METADATA_BYTES)
+    limit("PE resource result exceeds the 8 MiB allocation budget.", "memory");
   return report;
 };
 
@@ -252,6 +316,7 @@ const readIconGroups = (
   bytes: Buffer,
   resources: PeResources["resources"],
   account: (value: unknown) => void,
+  ensureCapacity: (projectedBytes: number) => void,
 ): PeResources["icon_groups"] => {
   const imagesById = new Map<number, PeResources["resources"]>();
   for (const resource of resources) {
@@ -289,6 +354,9 @@ const readIconGroups = (
           (resource) =>
             identityKey(resource.language) === identityKey(group.language),
         );
+        // Indices are uint32 values and each needs at most ten decimal digits
+        // plus a comma. Check the expanded candidate list before allocating it.
+        ensureCapacity(302 + candidates.length * 11);
         const declaredBytes = bytes.readUInt32LE(at + 8);
         const image = {
           location: { offset: at, bytes: 14 },
@@ -310,6 +378,7 @@ const readIconGroups = (
         account(image);
         images.push(image);
       }
+      account({ resource_index: group.index, images: [] });
       return { resource_index: group.index, images };
     });
 };

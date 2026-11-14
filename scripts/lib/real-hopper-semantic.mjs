@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { requireFunctionDossierOracle } from "../../dist/application/RealHopperAssertions.js";
+
+import { requireFunctionDossierOracle } from "./real-hopper-assertions.mjs";
 
 /** Require truthful tri-state permissions from real Hopper memory regions. */
 export const requireTruthfulMemoryRegions = (segments) => {
@@ -205,13 +206,13 @@ export async function verifyRealHopperFixture({
   );
   return {
     procedures: { main, entry, branch, leaf },
-    entryComments: entryDossier.comments.returned,
-    entryStrings: entryDossier.referenced_strings.returned,
-    entryCallees: entryDossier.callees.returned,
-    branchCallees: branchDossier.callees.returned,
-    branchBlocks: branchDossier.basic_blocks.returned,
-    leafStrings: leafDossier.referenced_strings.returned,
-    leafNames: leafDossier.referenced_names.returned,
+    entryComments: entryDossier.comments.length,
+    entryStrings: entryDossier.referenced_strings.length,
+    entryCallees: entryDossier.callees.length,
+    branchCallees: branchDossier.callees.length,
+    branchBlocks: branchDossier.basic_blocks.length,
+    leafStrings: leafDossier.referenced_strings.length,
+    leafNames: leafDossier.referenced_names.length,
   };
 }
 
@@ -309,19 +310,62 @@ export async function resolveFixtureProcedure(
 }
 
 /** Request the assembly evidence required by the fixture oracle. */
-export const analyzeFixtureProcedure = async (
+const analyzeFixtureProcedure = async (
   client,
   options,
   procedure,
   normalizedResult,
-) =>
-  normalizedResult(
+) => {
+  const reply = await client.callTool(
+    {
+      name: "analyze_function",
+      arguments: { procedure: procedure.address, detail: "complete" },
+    },
+    options,
+  );
+  const dossier = normalizedResult(reply, "analyze_function");
+  assert.deepEqual(reply.structuredContent.relationship_coverage, {
+    status: "complete",
+  });
+  for (const facet of [
+    "pseudocode",
+    "assembly",
+    "comments",
+    "callers",
+    "callees",
+    "references",
+    "strings_names",
+    "cfg",
+  ])
+    assert.deepEqual(dossier.facet_availability[facet], { available: true });
+  const comparison = normalizedResult(
     await client.callTool(
       {
-        name: "analyze_function",
-        arguments: { procedure: procedure.address },
+        name: "compare_functions",
+        arguments: {
+          left: reply.structuredContent,
+          right: reply.structuredContent,
+        },
       },
       options,
     ),
-    "analyze_function",
+    "compare_functions",
   );
+  assert.deepEqual(
+    Object.fromEntries(
+      comparison.dimensions.map(({ dimension, status }) => [dimension, status]),
+    ),
+    {
+      identity: "unchanged",
+      pseudocode: "unchanged",
+      assembly: "unchanged",
+      comments: "unchanged",
+      calls: "unchanged",
+      references: "unknown",
+      strings_names: "unchanged",
+      cfg: "unchanged",
+    },
+    JSON.stringify(comparison.dimensions),
+  );
+  return dossier;
+};
